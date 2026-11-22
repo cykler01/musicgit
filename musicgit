@@ -1,0 +1,1078 @@
+#!/usr/bin/env python3
+"""
+musicgit - keep a local music folder in sync with YouTube Music playlists.
+
+It behaves like git for your music: the playlist folder is the working tree,
+`.musicgit/snapshots/<remote>.json` is the last known upstream state, and
+`pull` downloads only what is missing, so re-running it is always safe.
+
+    musicgit init ~/Music/library
+    cd ~/Music/library
+    musicgit remote add faves 'https://music.youtube.com/playlist?list=PL...'
+    musicgit status                 # what would change (no network, last snapshot)
+    musicgit fetch                  # refresh the snapshots from YouTube
+    musicgit pull                   # download missing tracks
+    musicgit pull --prune           # ...and move upstream-deleted tracks aside
+    musicgit failed                 # every song that failed, with the reason
+    musicgit retry                  # re-download only those
+
+Audio is taken from the best stream YouTube serves and remuxed, never
+lossily re-encoded: `-f bestaudio/best` + `-x --audio-format best`.
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import json
+import os
+import re
+import shutil
+import socket
+import ssl
+import subprocess
+import sys
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
+
+STATE_DIR = ".musicgit"
+WATCH_URL = "https://music.youtube.com/watch?v="
+DEFAULT_LIBRARY = "~/Music/library"
+AUDIO_EXTS = {".opus", ".m4a", ".webm", ".mp3", ".flac", ".ogg", ".aac", ".wav"}
+IGNORED_EXTS = {".part", ".ytdl", ".temp", ".jpg", ".jpeg", ".webp", ".png", ".json", ".m3u8"}
+TRACK_TIMEOUT = 1800  # seconds per song
+
+TLS_HINT = (
+    "  A proxy or content filter on this network is intercepting YouTube TLS"
+    " (the certificate is not issued by Google), so yt-dlp cannot read the\n"
+    "  playlist or download audio. Use a network without the filter, or ask its"
+    "  admin to trust the interception root CA."
+)
+
+
+class FetchError(Exception):
+    """Raised when the playlist metadata cannot be read."""
+
+
+# --------------------------------------------------------------------------- #
+# small helpers
+# --------------------------------------------------------------------------- #
+
+def now() -> str:
+    return dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def die(msg: str, code: int = 1) -> "NoReturn":  # noqa: F821
+    print(f"musicgit: {msg}", file=sys.stderr)
+    raise SystemExit(code)
+
+
+def note(msg: str = "") -> None:
+    print(msg, flush=True)
+
+
+def write_atomic(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(text, encoding="utf-8")
+    tmp.replace(path)
+
+
+def read_json(path: Path, default):
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return default
+
+
+def sanitize(name: str, limit: int = 120) -> str:
+    name = re.sub(r'[/\\:*?"<>|\x00-\x1f]', "-", str(name))
+    name = re.sub(r"\s+", " ", name).strip(" .")
+    return name[:limit] or "unknown"
+
+
+def fmt_duration(seconds) -> str:
+    try:
+        seconds = int(seconds)
+    except (TypeError, ValueError):
+        return "?:??"
+    if seconds <= 0:
+        return "?:??"
+    return f"{seconds // 60}:{seconds % 60:02d}"
+
+
+def ytdlp_bin() -> str:
+    return os.environ.get("MUSICGIT_YTDLP", "yt-dlp")
+
+
+_EMBED: bool | None = None
+
+
+def embed_supported() -> bool:
+    """Embedding tags and cover art needs python-mutagen; skip it if absent."""
+    global _EMBED
+    if _EMBED is None:
+        for python in (sys.executable, shutil.which("python3")):
+            if not python:
+                continue
+            try:
+                if subprocess.run([python, "-c", "import mutagen"],
+                                  capture_output=True, timeout=30).returncode == 0:
+                    _EMBED = True
+                    break
+            except (OSError, subprocess.SubprocessError):
+                continue
+        else:
+            _EMBED = False
+    return _EMBED
+
+
+# --------------------------------------------------------------------------- #
+# repository / config
+# --------------------------------------------------------------------------- #
+
+def find_repo(start: str | None = None) -> Path | None:
+    cur = Path(start or os.getcwd()).expanduser().resolve()
+    for candidate in (cur, *cur.parents):
+        if (candidate / STATE_DIR).is_dir():
+            return candidate
+    return None
+
+
+def require_repo(explicit: str | None) -> Path:
+    if explicit:
+        path = Path(explicit).expanduser().resolve()
+        if not (path / STATE_DIR).is_dir():
+            die(f"no {STATE_DIR} in {path} - run 'musicgit init {path}' first")
+        return path
+    repo = find_repo()
+    if repo is None:
+        die(f"not a musicgit repo (no {STATE_DIR} here or above) - run 'musicgit init'")
+    return repo
+
+
+def config_path(repo: Path) -> Path:
+    return repo / STATE_DIR / "config.json"
+
+
+def load_config(repo: Path) -> dict:
+    cfg = read_json(config_path(repo), None)
+    if not isinstance(cfg, dict):
+        die(f"{config_path(repo)} is missing or corrupt")
+    cfg.setdefault("remotes", {})
+    cfg.setdefault("audio_format", "best")
+    return cfg
+
+
+def save_config(repo: Path, cfg: dict) -> None:
+    write_atomic(config_path(repo), json.dumps(cfg, indent=2) + "\n")
+
+
+def snapshot_path(repo: Path, remote: str) -> Path:
+    return repo / STATE_DIR / "snapshots" / f"{remote}.json"
+
+
+def failures_path(repo: Path) -> Path:
+    return repo / STATE_DIR / "failures.json"
+
+
+def substitutions_path(repo: Path) -> Path:
+    return repo / STATE_DIR / "substitutions.json"
+
+
+def load_substitutions(repo: Path) -> dict:
+    data = read_json(substitutions_path(repo), {})
+    return data if isinstance(data, dict) else {}
+
+
+def save_substitutions(repo: Path, subs: dict) -> None:
+    write_atomic(substitutions_path(repo), json.dumps(subs, indent=2, sort_keys=True) + "\n")
+
+
+def load_failures(repo: Path) -> dict:
+    data = read_json(failures_path(repo), {})
+    return data if isinstance(data, dict) else {}
+
+
+def save_failures(repo: Path, failures: dict) -> None:
+    pruned = {}
+    for remote, items in failures.items():
+        if items:
+            pruned[remote] = items
+    write_atomic(failures_path(repo), json.dumps(pruned, indent=2, sort_keys=True) + "\n")
+    write_failures_md(repo, pruned)
+
+
+def write_failures_md(repo: Path, failures: dict) -> None:
+    lines = ["# Failed songs", ""]
+    if not failures:
+        lines.append("Nothing failed. Every track in the last sync is on disk.")
+    else:
+        lines.append(f"Generated {now()}. Re-run `musicgit retry` to try again.")
+        for remote in sorted(failures):
+            lines += ["", f"## {remote}", ""]
+            for item in sorted(failures[remote].values(),
+                               key=lambda i: (i.get("index") or 0, i.get("title", ""))):
+                lines.append(
+                    f"- {item.get('artist') or 'Unknown'} - {item.get('title')}"
+                    f"  ({item.get('url')})  \n  reason: {item.get('reason', 'unknown')}"
+                )
+    write_atomic(repo / STATE_DIR / "failures.md", "\n".join(lines) + "\n")
+
+
+def append_log(repo: Path, entry: dict) -> None:
+    path = repo / STATE_DIR / "log.jsonl"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps(entry) + "\n")
+
+
+def playlist_dir(repo: Path, remote: str) -> Path:
+    """Folder holding this remote's audio: the playlist title, fixed on first fetch."""
+    snap = read_json(snapshot_path(repo, remote), None)
+    if isinstance(snap, dict) and snap.get("dir"):
+        return repo / str(snap["dir"])
+    return repo / remote
+
+
+# --------------------------------------------------------------------------- #
+# yt-dlp: playlist metadata
+# --------------------------------------------------------------------------- #
+
+def cookie_args(cfg: dict) -> list[str]:
+    args: list[str] = []
+    if cfg.get("cookies_from_browser"):
+        args += ["--cookies-from-browser", str(cfg["cookies_from_browser"])]
+    if cfg.get("cookies_file"):
+        args += ["--cookies", str(Path(cfg["cookies_file"]).expanduser())]
+    return args
+
+
+def tls_peer() -> str:
+    """Name the certificate actually presented for www.youtube.com, if we can."""
+    try:
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        with socket.create_connection(("www.youtube.com", 443), timeout=10) as sock:
+            with ctx.wrap_socket(sock, server_hostname="www.youtube.com") as tls:
+                der = tls.getpeercert(binary_form=True)
+        pem = ssl.DER_cert_to_PEM_cert(der)
+        proc = subprocess.run(
+            ["openssl", "x509", "-noout", "-issuer", "-subject"],
+            input=pem, capture_output=True, text=True, timeout=20,
+        )
+        return " ".join(line.strip() for line in proc.stdout.splitlines() if line.strip())
+    except Exception:  # noqa: BLE001 - purely diagnostic
+        return ""
+
+
+def normalize_url(value: str) -> str:
+    value = value.strip()
+    if value.startswith(("http://", "https://")):
+        return value
+    if re.fullmatch(r"[A-Za-z0-9_-]{10,}", value):
+        return f"https://music.youtube.com/playlist?list={value}"
+    return value
+
+
+def clean_artist(value: str) -> str:
+    """YouTube Music auto-generated channels are named "Artist - Topic"."""
+    value = re.sub(r"\s*-\s*Topic$", "", str(value or ""))
+    return re.sub(r"\s+", " ", value).strip()
+
+
+def entry_artist(entry: dict) -> str:
+    for key in ("artist", "artists", "creator", "uploader", "channel"):
+        value = entry.get(key)
+        if isinstance(value, list) and value:
+            return ", ".join(str(v) for v in value if v)
+        if value:
+            return str(value)
+    return ""
+
+
+def fetch_playlist(url: str, cfg: dict) -> dict:
+    cmd = [
+        ytdlp_bin(), "--ignore-config", "-J", "--flat-playlist",
+        "--no-warnings", "--no-color", *cookie_args(cfg), url,
+    ]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+    except FileNotFoundError:
+        raise FetchError("yt-dlp is not installed (or not on PATH)") from None
+    except subprocess.TimeoutExpired:
+        raise FetchError("timed out while reading the playlist") from None
+
+    if proc.returncode != 0 or not (proc.stdout or "").strip():
+        combined = (proc.stderr or "") + (proc.stdout or "")
+        if "CERTIFICATE_VERIFY_FAILED" in combined:
+            peer = tls_peer()
+            detail = f"\n  www.youtube.com presents: {peer}" if peer else ""
+            raise FetchError("TLS certificate verification failed." + detail + "\n" + TLS_HINT)
+        errors = [line.strip() for line in (proc.stderr or "").splitlines() if "ERROR" in line]
+        reason = errors[-1] if errors else (proc.stderr or proc.stdout or "").strip()
+        raise FetchError(reason[-500:] or "yt-dlp returned no data for this URL")
+
+    try:
+        meta = json.loads(proc.stdout)
+    except json.JSONDecodeError:
+        raise FetchError("yt-dlp returned unexpected metadata") from None
+
+    if meta.get("_type") != "playlist":
+        raise FetchError("that URL is not a playlist")
+
+    tracks = []
+    for position, entry in enumerate(meta.get("entries") or [], start=1):
+        if not entry:
+            continue
+        video_id = entry.get("id")
+        if not video_id:
+            continue
+        tracks.append({
+            "id": str(video_id),
+            "index": position,
+            "title": str(entry.get("title") or video_id),
+            "artist": clean_artist(entry_artist(entry)),
+            "duration": entry.get("duration"),
+            "url": WATCH_URL + str(video_id),
+        })
+
+    if not tracks:
+        raise FetchError("the playlist is empty or private")
+
+    return {
+        "playlist_id": meta.get("id") or "",
+        "title": meta.get("title") or "",
+        "uploader": meta.get("uploader") or meta.get("channel") or "",
+        "tracks": tracks,
+    }
+
+
+def save_snapshot(repo: Path, remote: str, url: str, data: dict) -> dict:
+    previous = read_json(snapshot_path(repo, remote), None) or {}
+    folder = previous.get("dir") if isinstance(previous, dict) else None
+    if not folder:
+        folder = sanitize(data.get("title") or remote) or remote
+        if folder == STATE_DIR:
+            folder = remote
+    snap = {
+        "remote": remote,
+        "dir": folder,
+        "url": url,
+        "playlist_id": data["playlist_id"],
+        "title": data["title"],
+        "uploader": data["uploader"],
+        "fetched": now(),
+        "tracks": data["tracks"],
+    }
+    write_atomic(snapshot_path(repo, remote), json.dumps(snap, indent=1) + "\n")
+    return snap
+
+
+def load_snapshot(repo: Path, remote: str) -> dict | None:
+    snap = read_json(snapshot_path(repo, remote), None)
+    if isinstance(snap, dict) and isinstance(snap.get("tracks"), list):
+        return snap
+    return None
+
+
+# --------------------------------------------------------------------------- #
+# working tree
+# --------------------------------------------------------------------------- #
+
+ID_RE = re.compile(r"\[([A-Za-z0-9_-]{11})\]")
+
+
+def local_tracks(folder: Path) -> dict[str, Path]:
+    found: dict[str, Path] = {}
+    if not folder.is_dir():
+        return found
+    for path in sorted(folder.iterdir()):
+        if not path.is_file() or path.suffix.lower() in IGNORED_EXTS:
+            continue
+        match = ID_RE.search(path.name)
+        if match:
+            found.setdefault(match.group(1), path)
+    return found
+
+
+def download_track(repo: Path, remote: str, track: dict, cfg: dict) -> tuple[Path | None, str]:
+    """Download one song. Returns (path, "") on success or (None, reason).
+
+    `track['source_id']` lets a substitute upload be downloaded while the file
+    keeps the playlist's original video id.
+    """
+    src = track.get("source_id") or track["id"]
+    folder = playlist_dir(repo, remote)
+    incoming = folder / ".incoming"
+    incoming.mkdir(parents=True, exist_ok=True)
+
+    embed = ["--embed-metadata", "--embed-thumbnail"] if embed_supported() else []
+    cmd = [
+        ytdlp_bin(), "--ignore-config", "--no-warnings", "--no-color", "--no-playlist",
+        "-f", "bestaudio/best",
+        "-x", "--audio-format", str(cfg.get("audio_format") or "best"), "--audio-quality", "0",
+        *embed,
+        "--retries", "5", "--fragment-retries", "5",
+        "--retry-sleep", "exp=5:90", *cookie_args(cfg),
+        "-P", str(incoming), "-o", "%(id)s.%(ext)s", track["url"],
+    ]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=TRACK_TIMEOUT)
+    except FileNotFoundError:
+        return None, "yt-dlp is not installed (or not on PATH)"
+    except subprocess.TimeoutExpired:
+        return None, f"timed out after {TRACK_TIMEOUT}s"
+
+    produced = [
+        p for p in incoming.glob(f"{src}.*")
+        if p.suffix.lower() not in IGNORED_EXTS and not p.name.endswith(".part")
+    ]
+    if not produced:
+        for leftover in incoming.glob(f"{src}.*"):
+            if leftover.suffix.lower() in (".part", ".ytdl"):
+                leftover.unlink(missing_ok=True)
+        errors = [ln.strip() for ln in (proc.stderr or "").splitlines() if "ERROR" in ln]
+        reason = errors[-1] if errors else (proc.stderr or "").strip().splitlines()
+        if isinstance(reason, list):
+            reason = reason[-1] if reason else "yt-dlp produced no audio file"
+        if "CERTIFICATE_VERIFY_FAILED" in (proc.stderr or ""):
+            reason += "\n  " + TLS_HINT.strip().replace("\n", "\n  ")
+        return None, reason[:500]
+
+    # The audio itself is complete even if a postprocessing step failed, so a
+    # finished file is always kept rather than thrown away.
+    audio = max(produced, key=lambda p: p.stat().st_size)
+    artist = sanitize(track.get("artist") or "Unknown", 80)
+    title = sanitize(track.get("title") or track["id"], 120)
+    index = int(track.get("index") or 0)
+    target = folder / f"{index:03d} - {artist} - {title} [{track['id']}]{audio.suffix.lower()}"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    audio.replace(target)
+    for leftover in incoming.glob(f"{src}.*"):
+        leftover.unlink(missing_ok=True)
+    return target, ""
+
+
+def write_m3u(repo: Path, remote: str, snap: dict, files: dict[str, Path]) -> None:
+    lines = ["#EXTM3U"]
+    for track in snap.get("tracks") or []:
+        path = files.get(track["id"])
+        if not path:
+            continue
+        lines.append(f"#EXTINF:{int(track.get('duration') or -1)},"
+                     f"{track.get('artist') or 'Unknown'} - {track.get('title')}")
+        lines.append(path.name)
+    write_atomic(playlist_dir(repo, remote) / "playlist.m3u8", "\n".join(lines) + "\n")
+
+
+# --------------------------------------------------------------------------- #
+# commands
+# --------------------------------------------------------------------------- #
+
+def cmd_init(args) -> int:
+    target = Path(args.dir).expanduser().resolve() if args.dir else Path.cwd()
+    if (target / STATE_DIR).is_dir():
+        die(f"already a musicgit repo: {target}", 0)
+    target.mkdir(parents=True, exist_ok=True)
+    (target / STATE_DIR / "snapshots").mkdir(parents=True, exist_ok=True)
+    save_config(target, {"remotes": {}, "audio_format": "best",
+                         "cookies_from_browser": None, "cookies_file": None})
+    write_atomic(target / STATE_DIR / "log.jsonl", "")
+    note(f"initialised empty musicgit repo in {target}")
+    note()
+    note("next steps:")
+    note(f"  cd {target}")
+    note("  musicgit remote add <name> '<playlist url>'")
+    note("  musicgit pull")
+    return 0
+
+
+def cmd_remote(args) -> int:
+    repo = require_repo(args.C)
+    cfg = load_config(repo)
+    remotes = cfg["remotes"]
+
+    if args.action == "list":
+        if not remotes:
+            note("no remotes yet - 'musicgit remote add <name> <url>'")
+            return 0
+        for name in sorted(remotes):
+            snap = load_snapshot(repo, name)
+            count = f"{len(snap['tracks'])} tracks" if snap else "not fetched yet"
+            title = f"  ({snap.get('title')})" if snap and snap.get("title") else ""
+            note(f"{name:<14} {count}{title}")
+            note(f"{'':<14} {remotes[name]}")
+        return 0
+
+    if not args.name:
+        die(f"usage: musicgit remote {args.action} <name>" +
+            (" <url>" if args.action == "add" else ""))
+
+    if args.action == "add":
+        if not args.url:
+            die("usage: musicgit remote add <name> <url>")
+        if args.name in remotes:
+            die(f"remote '{args.name}' already exists (url: {remotes[args.name]})")
+        if not re.fullmatch(r"[A-Za-z0-9._-]+", args.name):
+            die("remote names may only contain letters, digits, '.', '_' and '-'")
+        remotes[args.name] = normalize_url(args.url)
+        save_config(repo, cfg)
+        note(f"added remote '{args.name}' -> {remotes[args.name]}")
+        note("run 'musicgit pull' to download it")
+        return 0
+
+    if args.action == "remove":
+        if args.name not in remotes:
+            die(f"no remote named '{args.name}'")
+        del remotes[args.name]
+        save_config(repo, cfg)
+        snapshot_path(repo, args.name).unlink(missing_ok=True)
+        note(f"removed remote '{args.name}' (downloaded files were kept in {repo / args.name})")
+        return 0
+
+    die(f"unknown remote action '{args.action}'")
+
+
+def refresh(repo: Path, cfg: dict, remote: str, url: str) -> dict | None:
+    try:
+        data = fetch_playlist(url, cfg)
+    except FetchError as exc:
+        print(f"musicgit: {remote}: could not read playlist\n  {exc}", file=sys.stderr)
+        return None
+    return save_snapshot(repo, remote, url, data)
+
+
+def diff(repo: Path, snap: dict | None) -> dict:
+    files = local_tracks(playlist_dir(repo, snap["remote"])) if snap else {}
+    if not snap:
+        return {"new": [], "local": [], "have": files}
+    upstream = {t["id"] for t in snap.get("tracks") or []}
+    new = [t for t in snap.get("tracks") or [] if t["id"] not in files]
+    local = [{"id": vid, "path": path} for vid, path in files.items() if vid not in upstream]
+    return {"new": new, "local": local, "have": files}
+
+
+def cmd_status(args) -> int:
+    repo = require_repo(args.C)
+    cfg = load_config(repo)
+    failures = load_failures(repo)
+    names = [args.remote] if args.remote else sorted(cfg["remotes"])
+    if not names:
+        note("no remotes yet - 'musicgit remote add <name> <url>'")
+        return 0
+
+    for remote in names:
+        if remote not in cfg["remotes"]:
+            die(f"no remote named '{remote}'")
+        snap = load_snapshot(repo, remote)
+        note(f"remote {remote}  {cfg['remotes'][remote]}")
+        if snap is None:
+            note("  never fetched - run 'musicgit fetch'")
+            note()
+            continue
+        d = diff(repo, snap)
+        note(f"  playlist: {snap.get('title') or '?'}  "
+             f"({len(snap['tracks'])} tracks upstream, snapshot {snap['fetched']})")
+        for track in d["new"]:
+            note(f"  + new      {track['id']}  {track.get('artist') or '?'} - "
+                 f"{track.get('title')}  ({fmt_duration(track.get('duration'))})")
+        for item in d["local"]:
+            note(f"  - gone upstream  {item['id']}  {item['path'].name}")
+        for vid, item in sorted((failures.get(remote) or {}).items()):
+            note(f"  ! failed   {vid}  {item.get('artist') or '?'} - {item.get('title')}")
+        on_disk = len(d["have"])
+        if not d["new"] and not d["local"]:
+            note(f"  up to date ({on_disk} files on disk)")
+        else:
+            note(f"  {len(d['new'])} to download, {len(d['local'])} only local, "
+                 f"{on_disk} files on disk")
+        note()
+    return 0
+
+
+def cmd_fetch(args) -> int:
+    repo = require_repo(args.C)
+    cfg = load_config(repo)
+    names = [args.remote] if args.remote else sorted(cfg["remotes"])
+    if not names:
+        die("no remotes yet - 'musicgit remote add <name> <url>'")
+    bad = 0
+    for remote in names:
+        if remote not in cfg["remotes"]:
+            die(f"no remote named '{remote}'")
+        snap = refresh(repo, cfg, remote, cfg["remotes"][remote])
+        if snap is None:
+            bad += 1
+            continue
+        note(f"{remote}: {len(snap['tracks'])} tracks - {snap.get('title') or '?'}")
+        append_log(repo, {"at": now(), "remote": remote, "action": "fetch",
+                          "tracks": len(snap["tracks"])})
+    return 1 if bad else 0
+
+
+def run_downloads(repo: Path, remote: str, cfg: dict, tracks: list[dict], jobs: int):
+    """Yield (track, path, reason) for each download, `jobs` at a time."""
+    if jobs <= 1 or len(tracks) <= 1:
+        for track in tracks:
+            path, reason = download_track(repo, remote, track, cfg)
+            yield track, path, reason
+        return
+    with ThreadPoolExecutor(max_workers=jobs) as pool:
+        futures = {pool.submit(download_track, repo, remote, t, cfg): t for t in tracks}
+        for future in as_completed(futures):
+            track = futures[future]
+            try:
+                path, reason = future.result()
+            except Exception as exc:  # noqa: BLE001 - one bad track must not stop the run
+                path, reason = None, f"unexpected error: {exc}"
+            yield track, path, reason
+
+
+def pull_one(repo: Path, cfg: dict, remote: str, args) -> int:
+    url = cfg["remotes"][remote]
+    note(f"==> {remote}  {url}")
+    snap = refresh(repo, cfg, remote, url)
+    if snap is None:
+        return 1
+
+    files = local_tracks(playlist_dir(repo, remote))
+    pending = [t for t in snap["tracks"] if t["id"] not in files]
+    gone = [{"id": vid, "path": path} for vid, path in files.items()
+            if vid not in {t["id"] for t in snap["tracks"]}]
+
+    note(f"    {len(snap['tracks'])} upstream, {len(files)} on disk, "
+         f"{len(pending)} to download, {len(gone)} only local")
+
+    failures = load_failures(repo)
+    remote_failures = failures.setdefault(remote, {})
+    added = failed = 0
+    started = time.time()
+
+    if args.dry_run:
+        for position, track in enumerate(pending, start=1):
+            note(f"    would download [{position}/{len(pending)}] "
+                 f"{track.get('artist') or '?'} - {track.get('title')}")
+        pending = []
+
+    jobs = max(1, getattr(args, "jobs", 1))
+    for position, (track, path, reason) in enumerate(
+            run_downloads(repo, remote, cfg, pending, jobs), start=1):
+        label = f"[{position}/{len(pending)}] {track.get('artist') or '?'} - {track.get('title')}"
+        if path is None:
+            failed += 1
+            remote_failures[track["id"]] = {
+                "title": track["title"], "artist": track.get("artist") or "",
+                "url": track["url"], "index": track.get("index"),
+                "reason": reason, "at": now(),
+            }
+            note(f"    FAILED {label}\n           {reason}")
+        else:
+            added += 1
+            remote_failures.pop(track["id"], None)
+            note(f"    ok  {label}  -> {path.name}")
+
+    pruned = 0
+    if gone and args.prune and not args.dry_run:
+        removed_dir = repo / STATE_DIR / "removed" / remote
+        for item in gone:
+            removed_dir.mkdir(parents=True, exist_ok=True)
+            item["path"].replace(removed_dir / item["path"].name)
+            pruned += 1
+            note(f"    pruned {item['path'].name} (no longer in the playlist)")
+
+    if not args.dry_run:
+        write_m3u(repo, remote, snap, local_tracks(playlist_dir(repo, remote)))
+        save_failures(repo, failures)
+        append_log(repo, {
+            "at": now(), "remote": remote, "action": "pull",
+            "tracks": len(snap["tracks"]), "added": added, "failed": failed,
+            "pruned": pruned, "seconds": round(time.time() - started, 1),
+        })
+
+    if failed:
+        note(f"    {failed} failed - see 'musicgit failed' / 'musicgit retry'")
+        return 1
+    note(f"    up to date ({added} downloaded)") if not args.dry_run else None
+    return 0
+
+
+def cmd_pull(args) -> int:
+    repo = require_repo(args.C)
+    cfg = load_config(repo)
+    if not embed_supported():
+        note("note: python-mutagen is missing, so tags/cover art are not embedded"
+             " (files are still full quality)")
+        note("      install it with:  pacman -S python-mutagen")
+    names = [args.remote] if args.remote else sorted(cfg["remotes"])
+    if not names:
+        die("no remotes yet - 'musicgit remote add <name> <url>'")
+    bad = 0
+    for remote in names:
+        if remote not in cfg["remotes"]:
+            die(f"no remote named '{remote}'")
+        bad += pull_one(repo, cfg, remote, args)
+    return 1 if bad else 0
+
+
+BAD_WORDS = ("slowed", "speed up", "sped up", "reverb", "8d", "nightcore", "1 hour",
+             "10 hours", "live", "cover", "remix", "mashup", "instrumental",
+             "karaoke", "reaction", "tutorial", "lesson", "interview")
+
+
+def normalize(text: str) -> str:
+    text = re.sub(r"[\(\[].*?[\)\]]", " ", str(text).lower())
+    text = re.sub(r"[^\w\s]", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def search_alternative(track: dict, cfg: dict, limit: int = 6) -> dict | None:
+    """Find the best alternate upload of a song whose video is gone."""
+    artist = track.get("artist") or ""
+    artist = re.sub(r"\s*-\s*Topic$", "", artist)
+    query = " ".join(p for p in (artist, track.get("title")) if p)
+    cmd = [
+        ytdlp_bin(), "--ignore-config", "-J", "--flat-playlist", "--no-warnings",
+        "--no-color", *cookie_args(cfg), f"ytsearch{limit}:{query}",
+    ]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        entries = json.loads(proc.stdout).get("entries") or []
+    except (OSError, subprocess.SubprocessError, json.JSONDecodeError):
+        return None
+
+    want = normalize(track.get("title") or "")
+    want_words = set(want.split())
+    want_artist = normalize(artist)
+    target_len = track.get("duration") if isinstance(track.get("duration"), (int, float)) else None
+
+    best, best_score = None, 0.0
+    for entry in entries:
+        if not entry or not entry.get("id"):
+            continue
+        title = str(entry.get("title") or "")
+        channel = str(entry.get("channel") or entry.get("uploader") or "")
+        duration = entry.get("duration")
+        if target_len and isinstance(duration, (int, float)):
+            tolerance = max(25, target_len * 0.2)
+            if abs(duration - target_len) > tolerance:
+                continue
+        score = 0.0
+        cand = normalize(title)
+        if cand == want:
+            score += 10
+        elif want and (want in cand or cand in want):
+            score += 6
+        if want_words:
+            score += 5 * len(want_words & set(cand.split())) / len(want_words)
+        lowered = title.lower()
+        if any(word in lowered for word in BAD_WORDS) and not any(
+                word in (track.get("title") or "").lower() for word in BAD_WORDS):
+            score -= 8
+        chan = normalize(channel)
+        if want_artist and want_artist and (want_artist in chan or chan in want_artist):
+            score += 4
+        if "topic" in chan:
+            score += 3
+        if target_len and isinstance(duration, (int, float)):
+            score += max(0.0, 4 - abs(duration - target_len) / 10)
+        if score > best_score:
+            best, best_score = {
+                "id": str(entry["id"]), "title": title, "channel": channel,
+                "duration": duration, "url": WATCH_URL + str(entry["id"]),
+            }, score
+
+    if not best or best_score < 6:
+        return None
+    return best
+
+
+def cmd_failed(args) -> int:
+    repo = require_repo(args.C)
+    failures = load_failures(repo)
+    if args.remote:
+        failures = {args.remote: failures.get(args.remote, {})}
+    if args.json:
+        print(json.dumps(failures, indent=2, sort_keys=True))
+        return 0 if not any(failures.values()) else 1
+
+    total = sum(len(v) for v in failures.values())
+    if not total:
+        note("nothing failed - all tracks from the last sync are on disk")
+        return 0
+    for remote in sorted(failures):
+        if not failures[remote]:
+            continue
+        note(f"{remote}:")
+        for item in sorted(failures[remote].values(),
+                           key=lambda i: (i.get("index") or 0, i.get("title", ""))):
+            note(f"  {item.get('artist') or 'Unknown'} - {item.get('title')}")
+            note(f"    {item.get('url')}")
+            note(f"    reason: {item.get('reason', 'unknown')}")
+        note()
+    note(f"{total} failed song(s). Retry with: musicgit retry")
+    note(f"Full list also written to {failures_path(repo).parent / 'failures.md'}")
+    return 1
+
+
+def cmd_retry(args) -> int:
+    repo = require_repo(args.C)
+    cfg = load_config(repo)
+    failures = load_failures(repo)
+    names = [args.remote] if args.remote else sorted(failures)
+    if not names or not any(failures.get(n) for n in names):
+        note("nothing to retry")
+        return 0
+
+    still = 0
+    subs = load_substitutions(repo)
+    for remote in names:
+        items = failures.get(remote) or {}
+        if not items:
+            continue
+        # `--only` narrows what to retry without forgetting the other failures
+        selected = items
+        if args.only:
+            wanted = {v.strip() for v in args.only.split(",") if v.strip()}
+            selected = {k: v for k, v in items.items() if k in wanted}
+            if not selected:
+                note(f"==> {remote}: none of the requested ids are failing here")
+                continue
+        note(f"==> retrying {len(selected)} track(s) from '{remote}'")
+        playlist_dir(repo, remote).mkdir(parents=True, exist_ok=True)
+        order = sorted(selected.items())
+        durations = {t["id"]: t.get("duration")
+                     for t in (load_snapshot(repo, remote) or {}).get("tracks") or []}
+        tracks = []
+        for position, (vid, item) in enumerate(order, start=1):
+            tracks.append({"id": vid, "index": item.get("index") or position,
+                           "title": item.get("title") or vid,
+                           "artist": item.get("artist") or "",
+                           "duration": durations.get(vid) or item.get("duration"),
+                           "url": item.get("url") or WATCH_URL + vid})
+        jobs = max(1, getattr(args, "jobs", 1))
+        for position, (track, path, reason) in enumerate(
+                run_downloads(repo, remote, cfg, tracks, jobs), start=1):
+            vid = track["id"]
+            item = items[vid]
+            label = f"[{position}/{len(tracks)}] {track['artist'] or '?'} - {track['title']}"
+            if path is None and args.search:
+                alt = search_alternative(item | {"id": vid}, cfg)
+                if alt:
+                    note(f"    {label} is gone; trying alternate upload:\n"
+                         f"      {alt['channel']} - {alt['title']}  ({alt['url']})")
+                    alt_track = dict(track, url=alt["url"], source_id=alt["id"])
+                    path, reason = download_track(repo, remote, alt_track, cfg)
+                    if path is not None:
+                        subs.setdefault(remote, {})[vid] = {
+                            "source_id": alt["id"], "title": alt["title"],
+                            "channel": alt["channel"], "url": alt["url"], "at": now(),
+                        }
+            if path is None:
+                item["reason"] = reason
+                item["at"] = now()
+                still += 1
+                note(f"    still failing {label}\n           {reason}")
+            else:
+                items.pop(vid, None)
+                note(f"    ok  {label} -> {path.name}")
+        failures[remote] = items
+        snap = load_snapshot(repo, remote)
+        if snap:
+            write_m3u(repo, remote, snap, local_tracks(playlist_dir(repo, remote)))
+        append_log(repo, {"at": now(), "remote": remote, "action": "retry",
+                          "remaining": len(items)})
+    save_failures(repo, failures)
+    if subs:
+        save_substitutions(repo, subs)
+    if still:
+        note(f"{still} song(s) still failing - 'musicgit failed' for details")
+        return 1
+    note("all previously failed songs downloaded")
+    return 0
+
+
+def cmd_retag(args) -> int:
+    """Rewrite artist/album-artist tags on files already on disk (no re-download)."""
+    repo = require_repo(args.C)
+    cfg = load_config(repo)
+    try:
+        from mutagen import File as MutagenFile  # noqa: PLC0415 - optional dependency
+    except ImportError:
+        die("python-mutagen is needed for retag (pacman -S python-mutagen)")
+
+    names = [args.remote] if args.remote else sorted(cfg["remotes"])
+    tagged = skipped = 0
+    for remote in names:
+        folder = playlist_dir(repo, remote)
+        if not folder.is_dir():
+            continue
+        for path in sorted(folder.iterdir()):
+            if not path.is_file() or path.suffix.lower() not in AUDIO_EXTS:
+                continue
+            audio = MutagenFile(path, easy=True)
+            if audio is None:
+                skipped += 1
+                continue
+            raw_artist = (audio.get("artist") or [""])[0]
+            artist = clean_artist(raw_artist)
+            if not artist:
+                skipped += 1
+                continue
+            if args.dry_run:
+                if artist != raw_artist:
+                    note(f"would set artist '{artist}' (was '{raw_artist}') in {path.name}")
+                    tagged += 1
+                continue
+            audio["artist"] = [artist]
+            audio["albumartist"] = [artist]
+            title = (audio.get("title") or [""])[0].strip()
+            if title:
+                audio["title"] = [title]
+            album = (audio.get("album") or [""])[0].strip()
+            if album:
+                audio["album"] = [album]
+            audio.save()
+            tagged += 1
+            if artist != raw_artist:
+                note(f"{path.name}: artist '{raw_artist}' -> '{artist}'")
+    note(f"{tagged} file(s) {'would be ' if args.dry_run else ''}retagged, {skipped} skipped")
+    return 0
+
+
+def cmd_log(args) -> int:
+    repo = require_repo(args.C)
+    path = repo / STATE_DIR / "log.jsonl"
+    entries = []
+    if path.exists():
+        for line in path.read_text(encoding="utf-8").splitlines():
+            try:
+                entries.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+    if args.remote:
+        entries = [e for e in entries if e.get("remote") == args.remote]
+    if not entries:
+        note("no history yet")
+        return 0
+    for entry in entries[-args.limit:]:
+        if entry.get("action") == "fetch":
+            note(f"{entry['at']}  fetch  {entry['remote']}  {entry['tracks']} tracks")
+        elif entry.get("action") == "retry":
+            note(f"{entry['at']}  retry  {entry['remote']}  {entry['remaining']} still failing")
+        else:
+            note(f"{entry['at']}  pull   {entry['remote']}  "
+                 f"+{entry.get('added', 0)} new, {entry.get('failed', 0)} failed, "
+                 f"{entry.get('pruned', 0)} pruned  ({entry.get('seconds', '?')}s)")
+    return 0
+
+
+def cmd_config(args) -> int:
+    repo = require_repo(args.C)
+    cfg = load_config(repo)
+    changed = False
+    if args.cookies_from_browser is not None:
+        cfg["cookies_from_browser"] = args.cookies_from_browser or None
+        changed = True
+    if args.cookies_file is not None:
+        cfg["cookies_file"] = args.cookies_file or None
+        changed = True
+    if args.audio_format is not None:
+        cfg["audio_format"] = args.audio_format
+        changed = True
+    if changed:
+        save_config(repo, cfg)
+        note("configuration updated")
+    for key in ("audio_format", "cookies_from_browser", "cookies_file"):
+        note(f"{key:<22} {cfg.get(key) or '-'}")
+    note(f"remotes                {', '.join(sorted(cfg['remotes'])) or '-'}")
+    return 0
+
+
+# --------------------------------------------------------------------------- #
+# CLI
+# --------------------------------------------------------------------------- #
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="musicgit",
+        description="Keep a local music folder in sync with YouTube Music playlists.",
+    )
+    parser.add_argument("-C", metavar="DIR", help="run as if musicgit started in DIR")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    p = sub.add_parser("init", help="create an empty library repo")
+    p.add_argument("dir", nargs="?", help=f"where (default: {DEFAULT_LIBRARY})")
+
+    p = sub.add_parser("remote", help="manage playlists (remotes)")
+    p.add_argument("action", choices=["add", "list", "remove"])
+    p.add_argument("name", nargs="?")
+    p.add_argument("url", nargs="?")
+
+    p = sub.add_parser("status", help="show what pull would change (uses last snapshot)")
+    p.add_argument("remote", nargs="?")
+
+    p = sub.add_parser("fetch", help="refresh playlist snapshots without downloading")
+    p.add_argument("remote", nargs="?")
+
+    for name, help_text in (("pull", "download new tracks and report failures"),
+                            ("sync", "alias for pull")):
+        p = sub.add_parser(name, help=help_text)
+        p.add_argument("remote", nargs="?")
+        p.add_argument("-j", "--jobs", type=int, default=1,
+                       help="download N tracks at once (default 1)")
+        p.add_argument("--prune", action="store_true",
+                       help="move tracks deleted upstream into .musicgit/removed/")
+        p.add_argument("--dry-run", action="store_true", help="show what would happen")
+
+    p = sub.add_parser("retry", help="re-download only the songs that failed")
+    p.add_argument("remote", nargs="?")
+    p.add_argument("-j", "--jobs", type=int, default=1,
+                   help="retry N tracks at once (default 1)")
+    p.add_argument("--search", action="store_true",
+                   help="if a video is gone, download the best alternate upload instead")
+    p.add_argument("--only", metavar="IDS",
+                   help="comma separated video ids to retry (default: all failures)")
+
+    p = sub.add_parser("failed", help="list songs that failed to download")
+    p.add_argument("remote", nargs="?")
+    p.add_argument("--json", action="store_true")
+
+    p = sub.add_parser("retag", help="clean artist tags on files already on disk")
+    p.add_argument("remote", nargs="?")
+    p.add_argument("--dry-run", action="store_true")
+
+    p = sub.add_parser("log", help="show sync history")
+    p.add_argument("remote", nargs="?")
+    p.add_argument("-n", "--limit", type=int, default=20)
+
+    p = sub.add_parser("config", help="show or change settings")
+    p.add_argument("--cookies-from-browser", metavar="BROWSER")
+    p.add_argument("--cookies-file", metavar="FILE")
+    p.add_argument("--audio-format", metavar="FMT")
+
+    return parser
+
+
+COMMANDS = {
+    "init": cmd_init, "remote": cmd_remote, "status": cmd_status,
+    "fetch": cmd_fetch, "pull": cmd_pull, "sync": cmd_pull,
+    "retry": cmd_retry, "failed": cmd_failed, "log": cmd_log, "config": cmd_config,
+    "retag": cmd_retag,
+}
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    try:
+        return COMMANDS[args.command](args)
+    except KeyboardInterrupt:
+        print("\nmusicgit: interrupted - finished songs are kept, "
+              "failures so far are recorded", file=sys.stderr)
+        return 130
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,60 @@
+#!/usr/bin/env python3
+"""Stand-in for yt-dlp so the musicgit tests never touch the network.
+
+Controlled through environment variables:
+  FAKE_PLAYLIST     path to a playlist JSON (metadata mode)
+  FAKE_FAIL         comma separated video ids that must fail to download
+  FAKE_CERT_ERROR   "1" -> every call fails with a TLS certificate error
+  FAKE_POSTPROCESS_ERROR  "1" -> the file is written, but postprocessing fails
+"""
+
+import json
+import os
+import sys
+from pathlib import Path
+
+CERT_ERROR = (
+    "ERROR: [youtube:tab] Unable to download API page: [SSL: CERTIFICATE_VERIFY_FAILED] "
+    "certificate verify failed: unable to get local issuer certificate (_ssl.c:1082)"
+)
+
+
+def main() -> int:
+    argv = sys.argv[1:]
+
+    if os.environ.get("FAKE_CERT_ERROR") == "1":
+        print(CERT_ERROR, file=sys.stderr)
+        return 1
+
+    url = argv[-1]
+
+    if url.startswith("ytsearch"):
+        data = json.loads(Path(os.environ["FAKE_SEARCH_JSON"]).read_text(encoding="utf-8"))
+        print(json.dumps(data))
+        return 0
+
+    if "--flat-playlist" in argv or "-J" in argv:
+        data = json.loads(Path(os.environ["FAKE_PLAYLIST"]).read_text(encoding="utf-8"))
+        print(json.dumps(data))
+        return 0
+
+    video_id = url.split("v=")[-1].split("&")[0]
+    failing = {v.strip() for v in os.environ.get("FAKE_FAIL", "").split(",") if v.strip()}
+    if video_id in failing:
+        print(f"ERROR: [youtube] {video_id}: Video unavailable", file=sys.stderr)
+        return 1
+
+    outdir = Path(argv[argv.index("-P") + 1]) if "-P" in argv else Path(".")
+    outdir.mkdir(parents=True, exist_ok=True)
+    audio = outdir / f"{video_id}.opus"
+    audio.write_bytes(b"OggS" + b"\0" * 1024)
+    print(f"[download] 100% of {audio.name}", file=sys.stderr)
+    if os.environ.get("FAKE_POSTPROCESS_ERROR") == "1":
+        print("ERROR: Postprocessing: module mutagen was not found. "
+              "Please install using `python3 -m pip install mutagen`", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
