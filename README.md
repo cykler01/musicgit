@@ -39,6 +39,7 @@ musicgit -C ~/Music/library pull
 | `remote list` / `remote remove <name>` | show / stop tracking (files are kept) |
 | `fetch [remote]` | refresh playlist snapshots, download nothing |
 | `status [remote]` | diff last snapshot vs. disk: `+ new`, `- gone upstream`, `! failed` |
+| `playlist [remote]` | rewrite `playlist.m3u8` from the snapshots and disk, no network |
 | `pull [remote]` | fetch, then download every missing song; reports failures |
 | `pull --prune` | also move songs deleted upstream into `.musicgit/removed/` |
 | `pull --dry-run` | show what would be downloaded |
@@ -48,7 +49,7 @@ musicgit -C ~/Music/library pull
 | `failed [--json]` | list failures with their yt-dlp reason |
 | `retag [remote]` | strip YouTube's ` - Topic` suffix from artist tags (helps lyric lookup) |
 | `log [-n N]` | history of fetches and pulls |
-| `config` | show/change `--audio-format`, `--cookies-from-browser`, `--cookies-file` |
+| `config` | show/change `--audio-format`, `--cookies-from-browser`, `--cookies-file`, `--id-in-filename` |
 
 `-j/--jobs N` on `pull` and `retry` downloads N songs at once (default 1).
 
@@ -65,13 +66,29 @@ musicgit config --cookies-from-browser firefox   # or chrome, brave, ...
 
 Converting to FLAC would only make the files bigger, not better.
 
+## One folder for all songs
+
+By default each playlist keeps its own songs. To collect every playlist's audio
+in a single folder instead, point `songs_dir` at it (relative to the repo, or
+absolute) and regenerate the playlists:
+
+```bash
+musicgit config --songs-dir ../songs      # or an absolute path
+musicgit playlist                         # rewrite every playlist.m3u8
+```
+
+Entries in `playlist.m3u8` are always relative to the playlist file, so they
+become `../../songs/<file>.opus`. Downloads land in the songs dir and a song
+shared by two playlists is only stored once. `--prune` is skipped in this mode,
+since a shared folder cannot tell which playlist dropped a song.
+
 ## Output layout
 
 ```
 ~/Music/library/
 ├── The cedar Creek files/                    <- folder named after the playlist
-│   ├── 001 - Artist - Title [VIDEO_ID].opus
-│   ├── playlist.m3u8                         <- current upstream order
+│   ├── 001 - Artist - Title.opus            <- [VIDEO_ID] only if --id-in-filename is on
+│   ├── playlist.m3u8                         <- current upstream order (paths relative to it)
 │   └── .incoming/                            <- scratch space during downloads
 └── .musicgit/
     ├── config.json        remotes + settings

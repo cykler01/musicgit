@@ -162,6 +162,8 @@ def load_config(repo: Path) -> dict:
         die(f"{config_path(repo)} is missing or corrupt")
     cfg.setdefault("remotes", {})
     cfg.setdefault("audio_format", "best")
+    cfg.setdefault("songs_dir", None)
+    cfg.setdefault("id_in_filename", False)
     return cfg
 
 
@@ -229,11 +231,25 @@ def append_log(repo: Path, entry: dict) -> None:
 
 
 def playlist_dir(repo: Path, remote: str) -> Path:
-    """Folder holding this remote's audio: the playlist title, fixed on first fetch."""
+    """Folder holding this remote's playlist.m3u8: the playlist title, fixed on first fetch."""
     snap = read_json(snapshot_path(repo, remote), None)
     if isinstance(snap, dict) and snap.get("dir"):
         return repo / str(snap["dir"])
     return repo / remote
+
+
+def songs_dir(repo: Path, cfg: dict) -> Path | None:
+    """Optional folder holding every playlist's audio in one flat place."""
+    raw = cfg.get("songs_dir")
+    if not raw:
+        return None
+    path = Path(str(raw)).expanduser()
+    return path if path.is_absolute() else repo / path
+
+
+def audio_dir(repo: Path, cfg: dict, remote: str) -> Path:
+    """Where this remote's audio lives: the shared songs dir, else its own folder."""
+    return songs_dir(repo, cfg) or playlist_dir(repo, remote)
 
 
 # --------------------------------------------------------------------------- #
@@ -383,19 +399,93 @@ def load_snapshot(repo: Path, remote: str) -> dict | None:
 # --------------------------------------------------------------------------- #
 
 ID_RE = re.compile(r"\[([A-Za-z0-9_-]{11})\]")
+NUMBER_RE = re.compile(r"^\d+\s*-\s*")
 
 
-def local_tracks(folder: Path) -> dict[str, Path]:
+def track_stem(track: dict) -> str:
+    """The filename stem for a track, without the optional video id."""
+    artist = sanitize(track.get("artist") or "Unknown", 80)
+    title = sanitize(track.get("title") or track.get("id") or "unknown", 120)
+    index = int(track.get("index") or 0)
+    return f"{index:03d} - {artist} - {title}"
+
+
+def name_key(text: str) -> str:
+    """Artist - title, ignoring the track number, a [video id] and '- Topic'."""
+    text = NUMBER_RE.sub("", ID_RE.sub("", text))
+    # Older downloads kept YouTube's 'Artist - Topic' channel suffix in the
+    # name while snapshots store the cleaned artist, so ignore it when matching.
+    text = re.sub(r"\s+-\s+topic\b", "", text, flags=re.IGNORECASE)
+    return text.strip().casefold()
+
+
+def local_tracks(folder: Path, tracks: list[dict] | None = None) -> dict[str, Path]:
+    """Map video id -> audio file for the songs in `folder`.
+
+    A file tagged `[VIDEO_ID]` is matched by that id. A file without the tag is
+    matched to the snapshot's tracks by its `NNN - Artist - Title` name, so the
+    id in the filename is optional and older tagged files keep working.
+    """
     found: dict[str, Path] = {}
     if not folder.is_dir():
         return found
+    tracks = tracks or []
+    by_id = {t["id"]: t for t in tracks}
+    by_stem = {track_stem(t): t for t in tracks}
+    by_name: dict[str, list[dict]] = {}
+    for track in tracks:
+        by_name.setdefault(name_key(track_stem(track)), []).append(track)
+
+    unmatched: list[Path] = []
     for path in sorted(folder.iterdir()):
         if not path.is_file() or path.suffix.lower() in IGNORED_EXTS:
             continue
         match = ID_RE.search(path.name)
-        if match:
+        if match and match.group(1) in by_id:
             found.setdefault(match.group(1), path)
+            continue
+        track = by_stem.get(path.stem)
+        if track and track["id"] not in found:
+            found[track["id"]] = path
+            continue
+        unmatched.append(path)
+
+    # Match the rest by artist/title: an untagged song keeps matching when an
+    # upstream insert shifts its number, and duplicate names pair up in order.
+    remaining: list[Path] = []
+    for path in unmatched:
+        candidates = [t for t in by_name.get(name_key(path.stem), [])
+                      if t["id"] not in found]
+        if candidates:
+            found[candidates[0]["id"]] = path
+        else:
+            remaining.append(path)
+
+    # Last resort: a unique title still identifies the song when the artist was
+    # renamed upstream, so the file is not treated as gone and re-downloaded.
+    for path in remaining:
+        key = name_key(path.stem)
+        candidates = [t for t in tracks
+                      if t["id"] not in found and t.get("title")
+                      and key.endswith(" - " + name_key(str(t["title"])))]
+        if len(candidates) == 1:
+            found[candidates[0]["id"]] = path
     return found
+
+
+def unmatched_audio(folder: Path, files: dict[str, Path]) -> list[Path]:
+    """Audio in `folder` that no track of the playlist claimed (gone upstream)."""
+    if not folder.is_dir():
+        return []
+    known = {p.resolve() for p in files.values()}
+    return [p for p in sorted(folder.iterdir())
+            if p.is_file() and p.suffix.lower() in AUDIO_EXTS
+            and p.resolve() not in known]
+
+
+def file_id(path: Path) -> str:
+    match = ID_RE.search(path.name)
+    return match.group(1) if match else "?"
 
 
 def download_track(repo: Path, remote: str, track: dict, cfg: dict) -> tuple[Path | None, str]:
@@ -405,7 +495,7 @@ def download_track(repo: Path, remote: str, track: dict, cfg: dict) -> tuple[Pat
     keeps the playlist's original video id.
     """
     src = track.get("source_id") or track["id"]
-    folder = playlist_dir(repo, remote)
+    folder = audio_dir(repo, cfg, remote)
     incoming = folder / ".incoming"
     incoming.mkdir(parents=True, exist_ok=True)
 
@@ -445,10 +535,15 @@ def download_track(repo: Path, remote: str, track: dict, cfg: dict) -> tuple[Pat
     # The audio itself is complete even if a postprocessing step failed, so a
     # finished file is always kept rather than thrown away.
     audio = max(produced, key=lambda p: p.stat().st_size)
-    artist = sanitize(track.get("artist") or "Unknown", 80)
-    title = sanitize(track.get("title") or track["id"], 120)
-    index = int(track.get("index") or 0)
-    target = folder / f"{index:03d} - {artist} - {title} [{track['id']}]{audio.suffix.lower()}"
+    suffix = audio.suffix.lower()
+    stem = track_stem(track)
+    target = folder / f"{stem}{suffix}"
+    if cfg.get("id_in_filename"):
+        target = folder / f"{stem} [{track['id']}]{suffix}"
+    elif target.exists():
+        # The name is taken (a duplicate artist/title, or a re-download): keep
+        # the id so the two files stay distinguishable.
+        target = folder / f"{stem} [{track['id']}]{suffix}"
     target.parent.mkdir(parents=True, exist_ok=True)
     audio.replace(target)
     for leftover in incoming.glob(f"{src}.*"):
@@ -457,6 +552,7 @@ def download_track(repo: Path, remote: str, track: dict, cfg: dict) -> tuple[Pat
 
 
 def write_m3u(repo: Path, remote: str, snap: dict, files: dict[str, Path]) -> None:
+    folder = playlist_dir(repo, remote)
     lines = ["#EXTM3U"]
     for track in snap.get("tracks") or []:
         path = files.get(track["id"])
@@ -464,8 +560,9 @@ def write_m3u(repo: Path, remote: str, snap: dict, files: dict[str, Path]) -> No
             continue
         lines.append(f"#EXTINF:{int(track.get('duration') or -1)},"
                      f"{track.get('artist') or 'Unknown'} - {track.get('title')}")
-        lines.append(path.name)
-    write_atomic(playlist_dir(repo, remote) / "playlist.m3u8", "\n".join(lines) + "\n")
+        # Relative to the playlist file, so a shared songs dir works too.
+        lines.append(Path(os.path.relpath(path, folder)).as_posix())
+    write_atomic(folder / "playlist.m3u8", "\n".join(lines) + "\n")
 
 
 # --------------------------------------------------------------------------- #
@@ -478,7 +575,8 @@ def cmd_init(args) -> int:
         die(f"already a musicgit repo: {target}", 0)
     target.mkdir(parents=True, exist_ok=True)
     (target / STATE_DIR / "snapshots").mkdir(parents=True, exist_ok=True)
-    save_config(target, {"remotes": {}, "audio_format": "best",
+    save_config(target, {"remotes": {}, "audio_format": "best", "songs_dir": None,
+                         "id_in_filename": False,
                          "cookies_from_browser": None, "cookies_file": None})
     write_atomic(target / STATE_DIR / "log.jsonl", "")
     note(f"initialised empty musicgit repo in {target}")
@@ -545,14 +643,20 @@ def refresh(repo: Path, cfg: dict, remote: str, url: str) -> dict | None:
     return save_snapshot(repo, remote, url, data)
 
 
-def diff(repo: Path, snap: dict | None) -> dict:
-    files = local_tracks(playlist_dir(repo, snap["remote"])) if snap else {}
+def diff(repo: Path, cfg: dict, snap: dict | None) -> dict:
     if not snap:
-        return {"new": [], "local": [], "have": files}
+        return {"new": [], "local": [], "have": {}}
+    folder = audio_dir(repo, cfg, snap["remote"])
+    files = local_tracks(folder, snap.get("tracks"))
     upstream = {t["id"] for t in snap.get("tracks") or []}
+    shared = songs_dir(repo, cfg) is not None
+    # A shared songs dir also holds other playlists' audio, so only tracks that
+    # belong to this playlist count as "on disk" and nothing can be "gone".
+    have = {vid: p for vid, p in files.items() if vid in upstream} if shared else files
     new = [t for t in snap.get("tracks") or [] if t["id"] not in files]
-    local = [{"id": vid, "path": path} for vid, path in files.items() if vid not in upstream]
-    return {"new": new, "local": local, "have": files}
+    local = [] if shared else [{"id": file_id(p), "path": p}
+                               for p in unmatched_audio(folder, files)]
+    return {"new": new, "local": local, "have": have}
 
 
 def cmd_status(args) -> int:
@@ -573,7 +677,7 @@ def cmd_status(args) -> int:
             note("  never fetched - run 'musicgit fetch'")
             note()
             continue
-        d = diff(repo, snap)
+        d = diff(repo, cfg, snap)
         note(f"  playlist: {snap.get('title') or '?'}  "
              f"({len(snap['tracks'])} tracks upstream, snapshot {snap['fetched']})")
         for track in d["new"]:
@@ -613,6 +717,30 @@ def cmd_fetch(args) -> int:
     return 1 if bad else 0
 
 
+def cmd_playlist(args) -> int:
+    """Rewrite every playlist.m3u8 from the snapshots and the files on disk."""
+    repo = require_repo(args.C)
+    cfg = load_config(repo)
+    names = [args.remote] if args.remote else sorted(cfg["remotes"])
+    if not names:
+        die("no remotes yet - 'musicgit remote add <name> <url>'")
+    unready = 0
+    for remote in names:
+        if remote not in cfg["remotes"]:
+            die(f"no remote named '{remote}'")
+        snap = load_snapshot(repo, remote)
+        if snap is None:
+            note(f"{remote}: never fetched - run 'musicgit fetch' first")
+            unready += 1
+            continue
+        files = local_tracks(audio_dir(repo, cfg, remote), snap.get("tracks"))
+        write_m3u(repo, remote, snap, files)
+        listed = sum(1 for t in snap["tracks"] if t["id"] in files)
+        note(f"{remote}: {listed}/{len(snap['tracks'])} tracks -> "
+             f"{playlist_dir(repo, remote) / 'playlist.m3u8'}")
+    return 1 if unready else 0
+
+
 def run_downloads(repo: Path, remote: str, cfg: dict, tracks: list[dict], jobs: int):
     """Yield (track, path, reason) for each download, `jobs` at a time."""
     if jobs <= 1 or len(tracks) <= 1:
@@ -638,10 +766,12 @@ def pull_one(repo: Path, cfg: dict, remote: str, args) -> int:
     if snap is None:
         return 1
 
-    files = local_tracks(playlist_dir(repo, remote))
+    folder = audio_dir(repo, cfg, remote)
+    shared = songs_dir(repo, cfg) is not None
+    files = local_tracks(folder, snap.get("tracks"))
     pending = [t for t in snap["tracks"] if t["id"] not in files]
-    gone = [{"id": vid, "path": path} for vid, path in files.items()
-            if vid not in {t["id"] for t in snap["tracks"]}]
+    gone = [] if shared else [{"id": file_id(p), "path": p}
+                              for p in unmatched_audio(folder, files)]
 
     note(f"    {len(snap['tracks'])} upstream, {len(files)} on disk, "
          f"{len(pending)} to download, {len(gone)} only local")
@@ -674,6 +804,9 @@ def pull_one(repo: Path, cfg: dict, remote: str, args) -> int:
             remote_failures.pop(track["id"], None)
             note(f"    ok  {label}  -> {path.name}")
 
+    if shared and args.prune:
+        note("    not pruning - the songs dir is shared with the other playlists")
+
     pruned = 0
     if gone and args.prune and not args.dry_run:
         removed_dir = repo / STATE_DIR / "removed" / remote
@@ -684,7 +817,7 @@ def pull_one(repo: Path, cfg: dict, remote: str, args) -> int:
             note(f"    pruned {item['path'].name} (no longer in the playlist)")
 
     if not args.dry_run:
-        write_m3u(repo, remote, snap, local_tracks(playlist_dir(repo, remote)))
+        write_m3u(repo, remote, snap, local_tracks(folder, snap.get("tracks")))
         save_failures(repo, failures)
         append_log(repo, {
             "at": now(), "remote": remote, "action": "pull",
@@ -881,7 +1014,8 @@ def cmd_retry(args) -> int:
         failures[remote] = items
         snap = load_snapshot(repo, remote)
         if snap:
-            write_m3u(repo, remote, snap, local_tracks(playlist_dir(repo, remote)))
+            write_m3u(repo, remote, snap,
+                      local_tracks(audio_dir(repo, cfg, remote), snap.get("tracks")))
         append_log(repo, {"at": now(), "remote": remote, "action": "retry",
                           "remaining": len(items)})
     save_failures(repo, failures)
@@ -906,10 +1040,17 @@ def cmd_retag(args) -> int:
     names = [args.remote] if args.remote else sorted(cfg["remotes"])
     tagged = skipped = 0
     for remote in names:
-        folder = playlist_dir(repo, remote)
+        folder = audio_dir(repo, cfg, remote)
         if not folder.is_dir():
             continue
-        for path in sorted(folder.iterdir()):
+        if songs_dir(repo, cfg):
+            # Shared songs dir: only retag the audio this playlist actually uses.
+            snap = load_snapshot(repo, remote) or {}
+            found = local_tracks(folder, snap.get("tracks"))
+            paths = [found[t["id"]] for t in snap.get("tracks") or [] if t["id"] in found]
+        else:
+            paths = sorted(folder.iterdir())
+        for path in paths:
             if not path.is_file() or path.suffix.lower() not in AUDIO_EXTS:
                 continue
             audio = MutagenFile(path, easy=True)
@@ -982,11 +1123,23 @@ def cmd_config(args) -> int:
     if args.audio_format is not None:
         cfg["audio_format"] = args.audio_format
         changed = True
+    if args.songs_dir is not None:
+        cfg["songs_dir"] = args.songs_dir or None
+        changed = True
+    if args.id_in_filename is not None:
+        cfg["id_in_filename"] = bool(args.id_in_filename)
+        changed = True
     if changed:
         save_config(repo, cfg)
         note("configuration updated")
-    for key in ("audio_format", "cookies_from_browser", "cookies_file"):
-        note(f"{key:<22} {cfg.get(key) or '-'}")
+        if cfg.get("songs_dir"):
+            note("note: run 'musicgit playlist' to point the existing playlists at the songs dir")
+    for key in ("audio_format", "songs_dir", "id_in_filename",
+                "cookies_from_browser", "cookies_file"):
+        value = cfg.get(key)
+        if key == "id_in_filename":
+            value = "on" if value else "off"
+        note(f"{key:<22} {value or '-'}")
     note(f"remotes                {', '.join(sorted(cfg['remotes'])) or '-'}")
     return 0
 
@@ -1012,6 +1165,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("url", nargs="?")
 
     p = sub.add_parser("status", help="show what pull would change (uses last snapshot)")
+    p.add_argument("remote", nargs="?")
+
+    p = sub.add_parser("playlist", help="rewrite playlist.m3u8 files from the snapshots")
     p.add_argument("remote", nargs="?")
 
     p = sub.add_parser("fetch", help="refresh playlist snapshots without downloading")
@@ -1052,6 +1208,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--cookies-from-browser", metavar="BROWSER")
     p.add_argument("--cookies-file", metavar="FILE")
     p.add_argument("--audio-format", metavar="FMT")
+    p.add_argument("--songs-dir", metavar="DIR",
+                   help="keep every playlist's audio in this one folder (--songs-dir '' clears it)")
+    p.add_argument("--id-in-filename", dest="id_in_filename", action="store_true",
+                   default=None, help="append the YouTube id to downloaded filenames")
+    p.add_argument("--no-id-in-filename", dest="id_in_filename", action="store_false",
+                   default=None,
+                   help="name downloads 'NNN - Artist - Title' (default)")
 
     return parser
 
@@ -1059,8 +1222,8 @@ def build_parser() -> argparse.ArgumentParser:
 COMMANDS = {
     "init": cmd_init, "remote": cmd_remote, "status": cmd_status,
     "fetch": cmd_fetch, "pull": cmd_pull, "sync": cmd_pull,
-    "retry": cmd_retry, "failed": cmd_failed, "log": cmd_log, "config": cmd_config,
-    "retag": cmd_retag,
+    "playlist": cmd_playlist, "retry": cmd_retry, "failed": cmd_failed,
+    "log": cmd_log, "config": cmd_config, "retag": cmd_retag,
 }
 
 

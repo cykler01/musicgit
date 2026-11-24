@@ -99,17 +99,62 @@ class MusicgitTest(unittest.TestCase):
         self.assertIn("2 to download", status)
         self.assertFalse(list((self.repo / "faves").glob("*.opus")), "status must not download")
 
-    def test_pull_downloads_named_with_id(self):
+    def test_pull_downloads_without_the_id_tag_by_default(self):
         self.init_with_remote()
         self.run_cli("-C", str(self.repo), "pull", expect=0)
         names = self.audio_files()
-        self.assertEqual(len(names), 2)
-        self.assertTrue(names[0].startswith("001 - Artist - Song A [aaaaaaaaaaa]"))
-        self.assertTrue(names[1].startswith("002 - Artist - Song B [bbbbbbbbbbb]"))
+        self.assertEqual(names, ["001 - Artist - Song A.opus",
+                                 "002 - Artist - Song B.opus"])
         self.assertEqual(self.folder().name, "Test List")
         m3u = (self.folder() / "playlist.m3u8").read_text()
         self.assertIn("Song B", m3u)
         self.assertEqual(m3u.splitlines()[0], "#EXTM3U")
+
+    def test_id_in_filename_can_be_enabled(self):
+        self.init_with_remote()
+        self.run_cli("-C", str(self.repo), "config", "--id-in-filename")
+        self.run_cli("-C", str(self.repo), "pull", expect=0)
+        names = self.audio_files()
+        self.assertEqual(names[0], "001 - Artist - Song A [aaaaaaaaaaa].opus")
+        self.run_cli("-C", str(self.repo), "config", "--no-id-in-filename")
+        out = self.run_cli("-C", str(self.repo), "config").stdout
+        self.assertIn("id_in_filename", out)
+        self.assertIn("off", out)
+
+    def test_untagged_file_still_matches_when_artist_is_renamed(self):
+        self.init_with_remote()
+        self.run_cli("-C", str(self.repo), "pull", expect=0)
+        self.set_playlist("Test List", [track("aaaaaaaaaaa", "Song A", artist="Renamed"),
+                                        track("bbbbbbbbbbb", "Song B")])
+        self.run_cli("-C", str(self.repo), "fetch", expect=0)
+        status = self.run_cli("-C", str(self.repo), "status").stdout
+        self.assertNotIn("gone upstream", status)
+        self.assertIn("up to date", status)
+
+    def test_untagged_file_with_topic_suffix_still_matches(self):
+        self.init_with_remote()
+        self.run_cli("-C", str(self.repo), "pull", expect=0)
+        folder = self.folder()
+        (folder / "001 - Artist - Song A.opus").rename(
+            folder / "001 - Artist - Topic - Song A.opus")
+        status = self.run_cli("-C", str(self.repo), "status").stdout
+        self.assertIn("up to date", status)
+        self.assertNotIn("gone upstream", status)
+
+    def test_untagged_file_still_matches_after_upstream_reordering(self):
+        self.init_with_remote()
+        self.run_cli("-C", str(self.repo), "pull", expect=0)
+        self.set_playlist("Test List", [track("ccccccccccc", "Song C", artist="Other"),
+                                        track("aaaaaaaaaaa", "Song A"),
+                                        track("bbbbbbbbbbb", "Song B")])
+        self.run_cli("-C", str(self.repo), "fetch", expect=0)
+        status = self.run_cli("-C", str(self.repo), "status").stdout
+        self.assertIn("1 to download", status)
+        self.assertIn("Song C", status)
+        self.run_cli("-C", str(self.repo), "pull", expect=0)
+        self.assertEqual(self.audio_files(), ["001 - Artist - Song A.opus",
+                                              "001 - Other - Song C.opus",
+                                              "002 - Artist - Song B.opus"])
 
     def test_second_pull_is_a_no_op(self):
         self.init_with_remote()
@@ -141,6 +186,56 @@ class MusicgitTest(unittest.TestCase):
         proc = self.run_cli("-C", str(self.repo), "pull", expect=0)
         self.assertIn("1 downloaded", proc.stdout)
         self.assertEqual(len(self.audio_files()), 3)
+
+    def use_shared_songs_dir(self):
+        """Put every playlist's audio in self.tmp (the repo's parent)."""
+        self.run_cli("-C", str(self.repo), "config", "--songs-dir", "..")
+
+    def shared_audio(self):
+        return sorted(p.name for p in self.tmp.iterdir()
+                      if p.is_file() and p.suffix == ".opus")
+
+    def test_shared_songs_dir_downloads_there_and_links_relatively(self):
+        self.init_with_remote()
+        self.use_shared_songs_dir()
+        self.run_cli("-C", str(self.repo), "pull", expect=0)
+        self.assertEqual(len(self.shared_audio()), 2)
+        self.assertFalse(list(self.folder().glob("*.opus")))
+        m3u = (self.folder() / "playlist.m3u8").read_text().splitlines()
+        self.assertEqual(m3u[0], "#EXTM3U")
+        self.assertIn(f"../../{self.shared_audio()[0]}", m3u)
+        self.assertTrue((self.folder() / m3u[2]).resolve().is_file())
+
+    def test_shared_songs_dir_second_pull_is_a_no_op(self):
+        self.init_with_remote()
+        self.use_shared_songs_dir()
+        self.run_cli("-C", str(self.repo), "pull", expect=0)
+        proc = self.run_cli("-C", str(self.repo), "pull", expect=0)
+        self.assertIn("0 to download", proc.stdout)
+        status = self.run_cli("-C", str(self.repo), "status").stdout
+        self.assertIn("up to date (2 files on disk)", status)
+
+    def test_shared_songs_dir_hides_other_playlists_files(self):
+        self.init_with_remote()
+        self.use_shared_songs_dir()
+        self.run_cli("-C", str(self.repo), "pull", expect=0)
+        self.set_playlist("Other List", [track("ccccccccccc", "Song C")], playlist_id="PLother")
+        self.run_cli("-C", str(self.repo), "remote", "add", "other",
+                     "https://music.youtube.com/playlist?list=PLother")
+        self.run_cli("-C", str(self.repo), "pull", "other", expect=0)
+        status = self.run_cli("-C", str(self.repo), "status", "faves").stdout
+        self.assertNotIn("gone upstream", status)
+        self.assertIn("up to date", status)
+        self.assertEqual(len(self.shared_audio()), 3)
+
+    def test_playlist_command_rewrites_without_network(self):
+        self.init_with_remote()
+        self.run_cli("-C", str(self.repo), "pull", expect=0)
+        m3u = self.folder() / "playlist.m3u8"
+        m3u.unlink()
+        out = self.run_cli("-C", str(self.repo), "playlist").stdout
+        self.assertIn("2/2 tracks", out)
+        self.assertIn("Song B", m3u.read_text())
 
     def test_removed_track_is_reported_and_pruned_on_request(self):
         self.init_with_remote()
@@ -202,9 +297,9 @@ class MusicgitTest(unittest.TestCase):
         proc = self.run_cli("-C", str(self.repo), "retry", "--search", "-j", "1",
                             expect=0, env_extra={"FAKE_FAIL": "aaaaaaaaaaa"})
         self.assertIn("alternate upload", proc.stdout)
-        # file keeps the playlist's original id, so the entry now counts as done
-        self.assertTrue(any("[aaaaaaaaaaa]" in n and "Song A" in n
-                            for n in self.audio_files()))
+        # the file is named after the playlist's original track, so the entry
+        # now counts as done
+        self.assertIn("001 - Artist - Song A.opus", self.audio_files())
         subs = json.loads((self.repo / ".musicgit" / "substitutions.json").read_text())
         self.assertEqual(subs["faves"]["aaaaaaaaaaa"]["source_id"], "zzzzzzzzzzz")
         self.assertNotIn("faves", json.loads(
@@ -219,8 +314,8 @@ class MusicgitTest(unittest.TestCase):
                      env_extra={"FAKE_FAIL": "aaaaaaaaaaa,bbbbbbbbbbb"})
         self.run_cli("-C", str(self.repo), "retry", "--only", "bbbbbbbbbbb", expect=0)
         names = self.audio_files()
-        self.assertTrue(any("[bbbbbbbbbbb]" in n for n in names))
-        self.assertFalse(any("[aaaaaaaaaaa]" in n for n in names))
+        self.assertIn("002 - Artist - Song B.opus", names)
+        self.assertFalse(any("Song A" in n for n in names))
 
     def test_retry_only_keeps_the_other_failures(self):
         self.set_playlist("Test List", [track("aaaaaaaaaaa", "Song A"),
